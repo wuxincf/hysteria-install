@@ -176,14 +176,14 @@ install_dependencies() {
     info "检查系统依赖..."
 
     local packages=(
-        curl
-        wget
-        openssl
-        socat
-        ca-certificates
-        iproute
-        iptables
-    )
+    curl
+    wget
+    openssl
+    socat
+    ca-certificates
+    iproute2
+    iptables
+)
 
     case "${PM}" in
 
