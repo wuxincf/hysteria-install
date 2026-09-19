@@ -1,1223 +1,620 @@
 #!/usr/bin/env bash
-
-# ============================================================
-# Hysteria 2 一键安装 / 配置 / 卸载脚本
 #
-# 支持：
-#   Debian / Ubuntu / RHEL / Rocky / AlmaLinux / CentOS
+# Hysteria 2 Installer v2
+# Security-focused installer:
+# - Official Hysteria binary only
+# - SHA256 verification against official release hashes.txt
+# - amd64 / arm64 / armv7
+# - Debian / Ubuntu / RHEL-family / Alpine
+# - Built-in ACME (automatic issuance + renewal)
+# - Custom TLS certificate
+# - Salamander obfuscation
+# - Port hopping
+# - IPv4 / IPv6
+# - Dedicated unprivileged service user
+# - Minimal systemd/OpenRC privileges
+# - Atomic binary/config updates
+# - Full uninstall
+# - hysteria2:// URI output
 #
-# 功能：
-#   - 自动安装最新版 Hysteria 2
-#   - 自动安装 acme.sh
-#   - Let's Encrypt ECC 证书
-#   - 自动续期 + 自动部署证书
-#   - 单 UDP 端口
-#   - Linux 原生 UDP 端口跳跃
-#   - Salamander 混淆
-#   - 自定义 / 随机密码
-#   - systemd
-#   - 自动生成 hysteria2:// 分享链接
-#   - QR Code
-#   - status / restart / logs / info / uninstall
+# Usage:
+#   bash install.sh install
+#   bash install.sh update
+#   bash install.sh info
+#   bash install.sh status
+#   bash install.sh restart
+#   bash install.sh uninstall
 #
-# 修复：
-#   - pipefail + head SIGPIPE 导致 random_password() 失败
-#   - 端口占用判断
-#   - 证书续期
-#   - 配置检查
-#   - systemd 服务
-# ============================================================
-
+# Environment overrides:
+#   HY2_VERSION=v2.x.x
+#   HY2_LISTEN=:443
+#   HY2_HOPPING=20000-30000
+#   HY2_DOMAIN=example.com
+#   HY2_EMAIL=you@example.com
+#   HY2_PASSWORD=...
+#   HY2_OBFS_PASSWORD=...
+#
 set -Eeuo pipefail
+IFS=$'\n\t'
 
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
+readonly VERSION="2.0.0"
+readonly REPO="apernet/hysteria"
+readonly BIN="/usr/local/bin/hysteria"
+readonly ETC="/etc/hysteria"
+readonly CONF="${ETC}/config.yaml"
+readonly META="${ETC}/installer.env"
+readonly USER="hysteria"
+readonly GROUP="hysteria"
+readonly SYSTEMD_UNIT="/etc/systemd/system/hysteria-server.service"
+readonly OPENRC_UNIT="/etc/init.d/hysteria"
+readonly DOWNLOAD_BASE="https://github.com/apernet/hysteria/releases/download"
+readonly FALLBACK_BASE="https://download.hysteria.network/app/latest"
 
-# ============================================================
-# 基本路径
-# ============================================================
+log()  { printf '\033[1;32m[+] %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m[!] %s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[1;31m[✗] %s\033[0m\n' "$*" >&2; exit 1; }
 
-readonly HYSTERIA_DIR="/etc/hysteria"
-readonly CONFIG_FILE="${HYSTERIA_DIR}/config.yaml"
-readonly ENV_FILE="${HYSTERIA_DIR}/env"
-readonly DOMAIN_FILE="${HYSTERIA_DIR}/domain"
-
-readonly CERT_FILE="${HYSTERIA_DIR}/cert.crt"
-readonly KEY_FILE="${HYSTERIA_DIR}/private.key"
-
-readonly SHARE_FILE="${HYSTERIA_DIR}/share.txt"
-
-readonly HYSTERIA_BIN="/usr/local/bin/hysteria"
-readonly SERVICE_FILE="/etc/systemd/system/hysteria-server.service"
-
-readonly ACME_HOME="/root/.acme.sh"
-
-# ============================================================
-# 颜色
-# ============================================================
-
-RED='\033[31m'
-GREEN='\033[32m'
-YELLOW='\033[33m'
-BLUE='\033[34m'
-CYAN='\033[36m'
-RESET='\033[0m'
-
-# ============================================================
-# 输出
-# ============================================================
-
-log() {
-    echo -e "${GREEN}[+]${RESET} $*"
-}
-
-info() {
-    echo -e "${BLUE}[*]${RESET} $*"
-}
-
-warn() {
-    echo -e "${YELLOW}[!]${RESET} $*"
-}
-
-err() {
-    echo -e "${RED}[x]${RESET} $*" >&2
-}
-
-die() {
-    err "$*"
-    exit 1
-}
-
-# ============================================================
-# 错误处理
-# ============================================================
-
-trap 'err "脚本执行失败，行号：${LINENO}，命令：${BASH_COMMAND}"' ERR
-
-# ============================================================
-# Root
-# ============================================================
+trap 'die "执行失败：第 ${LINENO} 行，请检查上面的错误信息。"' ERR
 
 require_root() {
-    if [[ "${EUID}" -ne 0 ]]; then
-        die "请使用 root 用户运行此脚本。"
-    fi
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行。"
 }
 
-# ============================================================
-# 包管理器
-# ============================================================
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+}
 
-PM=""
+detect_os() {
+    [[ -r /etc/os-release ]] || die "无法识别 Linux 发行版。"
+    # shellcheck disable=SC1091
+    . /etc/os-release
 
-detect_pm() {
+    OS_ID="${ID:-unknown}"
+    OS_LIKE="${ID_LIKE:-}"
+    OS_VERSION_ID="${VERSION_ID:-}"
 
-    if command -v apt-get >/dev/null 2>&1; then
-        PM="apt"
+    case "$OS_ID" in
+        alpine)
+            INIT="openrc"
+            PKG="apk"
+            ;;
+        debian|ubuntu|linuxmint)
+            INIT="systemd"
+            PKG="apt"
+            ;;
+        rhel|rocky|almalinux|centos|fedora)
+            INIT="systemd"
+            if command -v dnf >/dev/null 2>&1; then PKG="dnf"; else PKG="yum"; fi
+            ;;
+        *)
+            if [[ "$OS_LIKE" == *debian* ]] || [[ "$OS_LIKE" == *ubuntu* ]]; then
+                INIT="systemd"; PKG="apt"
+            elif [[ "$OS_LIKE" == *rhel* ]] || [[ "$OS_LIKE" == *fedora* ]]; then
+                INIT="systemd"
+                if command -v dnf >/dev/null 2>&1; then PKG="dnf"; else PKG="yum"; fi
+            else
+                die "暂不支持发行版：${OS_ID}"
+            fi
+            ;;
+    esac
 
-    elif command -v dnf >/dev/null 2>&1; then
-        PM="dnf"
+    ARCH_RAW="$(uname -m)"
+    case "$ARCH_RAW" in
+        x86_64|amd64) HY2_ARCH="amd64" ;;
+        aarch64|arm64) HY2_ARCH="arm64" ;;
+        armv7l|armv7|armhf) HY2_ARCH="arm" ;;
+        *) die "暂不支持架构：${ARCH_RAW}（仅 amd64 / arm64 / armv7）" ;;
+    esac
 
-    elif command -v yum >/dev/null 2>&1; then
-        PM="yum"
-
+    if [[ "$INIT" == "systemd" ]]; then
+        command -v systemctl >/dev/null 2>&1 || die "系统标记为 systemd，但 systemctl 不存在。"
     else
-        die "未找到 apt-get / dnf / yum。"
+        command -v rc-service >/dev/null 2>&1 || die "Alpine OpenRC 不可用。"
     fi
 }
 
-pkg_update() {
+install_deps() {
+    log "安装基础依赖：${OS_ID} / ${HY2_ARCH}"
 
-    case "${PM}" in
-
+    case "$PKG" in
         apt)
+            export DEBIAN_FRONTEND=noninteractive
             apt-get update
+            apt-get install -y --no-install-recommends ca-certificates curl openssl iproute2
             ;;
-
         dnf)
-            dnf makecache
+            dnf install -y ca-certificates curl openssl iproute
             ;;
-
         yum)
-            yum makecache
+            yum install -y ca-certificates curl openssl iproute
             ;;
-
-    esac
-}
-
-pkg_install() {
-
-    case "${PM}" in
-
-        apt)
-            DEBIAN_FRONTEND=noninteractive \
-            apt-get install -y --no-install-recommends "$@"
+        apk)
+            apk add --no-cache ca-certificates curl openssl iproute2
             ;;
-
-        dnf)
-            dnf install -y "$@"
-            ;;
-
-        yum)
-            yum install -y "$@"
-            ;;
-
-    esac
-}
-
-# ============================================================
-# 依赖
-# ============================================================
-
-install_dependencies() {
-
-    detect_pm
-
-    info "检查系统依赖..."
-
-    local packages=(
-    curl
-    wget
-    openssl
-    socat
-    ca-certificates
-    iproute2
-    iptables
-)
-
-    case "${PM}" in
-
-        apt)
-            packages+=(
-                dnsutils
-                qrencode
-            )
-            ;;
-
-        dnf|yum)
-            packages+=(
-                bind-utils
-                qrencode
-            )
-            ;;
-
     esac
 
-    pkg_update
-
-    pkg_install "${packages[@]}"
-
-    log "依赖安装完成。"
+    update-ca-certificates >/dev/null 2>&1 || true
 }
 
-# ============================================================
-# 随机密码
-#
-# 重要：
-# 不再使用：
-#
-# tr ... | head -c 24
-#
-# 避免 set -o pipefail 下因为 SIGPIPE 失败。
-# ============================================================
-
-random_password() {
-
-    local password=""
-
-    if command -v openssl >/dev/null 2>&1; then
-
-        password="$(
-            openssl rand -hex 18 2>/dev/null
-        )"
-
-    else
-
-        password="$(
-            od -An -N18 -tx1 /dev/urandom |
-            tr -d '[:space:]'
-        )"
-
+ensure_user() {
+    if ! getent group "$GROUP" >/dev/null 2>&1; then
+        groupadd --system "$GROUP" 2>/dev/null || addgroup -S "$GROUP"
     fi
 
-    [[ -n "${password}" ]] || {
-        die "无法生成随机密码。"
-    }
+    if ! id "$USER" >/dev/null 2>&1; then
+        if command -v useradd >/dev/null 2>&1; then
+            useradd --system --gid "$GROUP" --home-dir "$ETC" \
+                --no-create-home --shell /usr/sbin/nologin "$USER"
+        else
+            adduser -S -D -H -s /sbin/nologin -G "$GROUP" "$USER"
+        fi
+    fi
 
-    printf '%s' "${password}"
+    mkdir -p "$ETC"
+    chown root:"$GROUP" "$ETC"
+    chmod 0750 "$ETC"
 }
 
-# ============================================================
-# 随机字符串 URL 编码
-# ============================================================
+get_latest_version() {
+    if [[ -n "${HY2_VERSION:-}" ]]; then
+        printf '%s\n' "$HY2_VERSION"
+        return
+    fi
 
-urlencode() {
+    local json tag
+    json="$(curl -fsSL --retry 3 --connect-timeout 10 \
+        "https://api.github.com/repos/${REPO}/releases/latest")" ||
+        die "无法获取 Hysteria 最新版本。"
 
-    local string="$1"
+    tag="$(printf '%s' "$json" |
+        sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' |
+        head -n1)"
 
-    python3 -c '
-import sys
-from urllib.parse import quote
+    [[ "$tag" =~ ^app/v2\.[0-9]+\.[0-9]+$ ]] ||
+        die "GitHub 返回的版本号异常：${tag:-empty}"
 
-print(quote(sys.argv[1], safe=""))
-' "${string}" 2>/dev/null || printf '%s' "${string}"
+    printf '%s\n' "$tag"
 }
 
-# ============================================================
-# 端口检查
-# ============================================================
+download_verified_binary() {
+    local version="$1"
+    local asset="hysteria-linux-${HY2_ARCH}"
+    local tmpdir tmpbin hashfile expected actual url
 
-valid_port() {
+    tmpdir="$(mktemp -d)"
+    tmpbin="${tmpdir}/hysteria"
+    hashfile="${tmpdir}/hashes.txt"
 
-    local port="$1"
+    url="${DOWNLOAD_BASE}/${version}/${asset}"
+    local hash_url="${DOWNLOAD_BASE}/${version}/hashes.txt"
 
-    [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+    log "下载官方 Hysteria：${version} / ${asset}"
+    curl -fL --retry 3 --connect-timeout 10 "$url" -o "$tmpbin" ||
+        die "Hysteria 二进制下载失败。"
 
-    (( port >= 1 && port <= 65535 ))
+    log "下载官方 SHA256：hashes.txt"
+    curl -fL --retry 3 --connect-timeout 10 "$hash_url" -o "$hashfile" ||
+        die "官方 hashes.txt 下载失败，拒绝安装未校验的二进制。"
+
+    expected="$(awk -v f="$asset" '$NF == f {print $1; exit}' "$hashfile")"
+    [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] ||
+        die "hashes.txt 中找不到 ${asset} 的 SHA256。"
+
+    actual="$(sha256sum "$tmpbin" | awk '{print $1}')"
+    if [[ "${actual,,}" != "${expected,,}" ]]; then
+        die "SHA256 校验失败！\n期望：${expected}\n实际：${actual}"
+    fi
+
+    log "SHA256 校验通过：${actual}"
+
+    chmod 0755 "$tmpbin"
+    # 原子替换，避免更新过程中留下半截可执行文件。
+    install -o root -g root -m 0755 "$tmpbin" "${BIN}.new"
+    mv -f "${BIN}.new" "$BIN"
+
+    rm -rf "$tmpdir"
 }
 
-udp_port_in_use() {
-
-    local port="$1"
-
-    ss -H -lun 2>/dev/null |
-        awk '{print $5}' |
-        grep -Eq "(^|:)${port}$"
-}
-
-tcp_port_in_use() {
-
-    local port="$1"
-
-    ss -H -ltn 2>/dev/null |
-        awk '{print $4}' |
-        grep -Eq "(^|:)${port}$"
-}
-
-# ============================================================
-# 公网 IPv4
-# ============================================================
-
-get_public_ipv4() {
-
-    curl -4fsS \
-        --connect-timeout 5 \
-        --max-time 10 \
-        https://api.ipify.org \
-        2>/dev/null || true
-}
-
-# ============================================================
-# DNS IPv4
-# ============================================================
-
-dns_ipv4() {
-
+validate_domain() {
     local domain="$1"
-
-    if command -v dig >/dev/null 2>&1; then
-
-        dig +short A "${domain}" 2>/dev/null |
-            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
-            head -n1 ||
-            true
-
-    else
-
-        getent ahostsv4 "${domain}" 2>/dev/null |
-            awk 'NR==1 {print $1}' ||
-            true
-
-    fi
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
+        die "域名格式不正确：$domain"
 }
 
-# ============================================================
-# 域名检查
-# ============================================================
-
-check_domain() {
-
-    local domain="$1"
-
-    local dns_ip
-    local public_ip
-
-    info "检查域名解析..."
-
-    dns_ip="$(dns_ipv4 "${domain}")"
-
-    [[ -n "${dns_ip}" ]] || {
-        die "域名 ${domain} 没有解析到 IPv4。"
-    }
-
-    log "域名 IPv4：${dns_ip}"
-
-    public_ip="$(get_public_ipv4)"
-
-    if [[ -n "${public_ip}" ]]; then
-
-        log "服务器 IPv4：${public_ip}"
-
-        if [[ "${dns_ip}" != "${public_ip}" ]]; then
-
-            die \
-                "域名 ${domain} 当前解析到 ${dns_ip}，" \
-                "但服务器公网 IPv4 是 ${public_ip}。"
-
-        fi
-
-    else
-
-        warn "无法获取服务器公网 IPv4。"
-
-        warn "将跳过 DNS / 公网 IP 自动比对。"
-    fi
+random_secret() {
+    openssl rand -hex 24
 }
 
-# ============================================================
-# 安装 Hysteria 2
-#
-# 使用官方安装脚本。
-# ============================================================
+prompt_install_values() {
+    echo
+    printf '\033[1;36m===== Hysteria 2 Installer v%s =====\033[0m\n' "$VERSION"
+    echo
 
-install_hysteria() {
+    HY2_DOMAIN="${HY2_DOMAIN:-}"
+    HY2_EMAIL="${HY2_EMAIL:-}"
+    HY2_PASSWORD="${HY2_PASSWORD:-}"
+    HY2_OBFS_PASSWORD="${HY2_OBFS_PASSWORD:-}"
+    HY2_LISTEN="${HY2_LISTEN:-:443}"
+    HY2_HOPPING="${HY2_HOPPING:-}"
 
-    if [[ -x "${HYSTERIA_BIN}" ]]; then
+    if [[ -z "$HY2_DOMAIN" ]]; then
+        read -r -p "请输入域名（ACME）： " HY2_DOMAIN
+    fi
+    validate_domain "$HY2_DOMAIN"
 
-        log "检测到 Hysteria 已安装。"
-
-        "${HYSTERIA_BIN}" version 2>/dev/null ||
-            true
-
-        return 0
+    if [[ -z "$HY2_EMAIL" ]]; then
+        read -r -p "请输入 ACME 邮箱： " HY2_EMAIL
     fi
 
-    info "安装最新版 Hysteria 2..."
-
-    curl -fsSL https://get.hy2.sh |
-        bash
-
-    [[ -x "${HYSTERIA_BIN}" ]] || {
-        die "Hysteria 2 安装失败。"
-    }
-
-    log "Hysteria 2 安装成功。"
-}
-
-# ============================================================
-# 安装 acme.sh
-# ============================================================
-
-install_acme() {
-
-    if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
-
-        info "安装 acme.sh..."
-
-        curl -fsSL https://get.acme.sh |
-            sh -s email="admin@${DOMAIN}"
+    if [[ -z "$HY2_PASSWORD" ]]; then
+        HY2_PASSWORD="$(random_secret)"
     fi
 
-    [[ -x "${ACME_HOME}/acme.sh" ]] || {
-        die "acme.sh 安装失败。"
-    }
+    read -r -p "Salamander 混淆密码（留空则自动生成）: " input_obfs
+    if [[ -n "$input_obfs" ]]; then HY2_OBFS_PASSWORD="$input_obfs"; fi
+    [[ -n "$HY2_OBFS_PASSWORD" ]] || HY2_OBFS_PASSWORD="$(random_secret)"
 
-    "${ACME_HOME}/acme.sh" \
-        --set-default-ca \
-        --server letsencrypt
+    if [[ -z "$HY2_HOPPING" ]]; then
+        read -r -p "Port Hopping 范围（留空禁用，例如 20000-30000）: " HY2_HOPPING
+    fi
 
-    "${ACME_HOME}/acme.sh" \
-        --upgrade \
-        --auto-upgrade ||
-        true
-
-    log "acme.sh 已准备完成。"
-}
-
-# ============================================================
-# 检查 TCP 80
-# ============================================================
-
-check_port_80() {
-
-    if tcp_port_in_use 80; then
-
-        warn "TCP 80 当前正在使用。"
-
-        ss -ltnp |
-            grep -E '(:80[[:space:]])|(:80$)' ||
-            true
-
-        die \
-            "Let's Encrypt standalone 需要 TCP 80 空闲。" \
-            "请停止占用 80 端口的程序后重新运行。"
+    if [[ -n "$HY2_HOPPING" ]]; then
+        [[ "$HY2_HOPPING" =~ ^[0-9]+-[0-9]+$ ]] ||
+            die "Port Hopping 必须是类似 20000-30000 的端口范围。"
+        local start end
+        start="${HY2_HOPPING%-*}"
+        end="${HY2_HOPPING#*-}"
+        (( start >= 1 && end <= 65535 && start < end )) ||
+            die "Port Hopping 范围无效。"
+        # 主监听端口取范围起点。
+        HY2_LISTEN=":${start}"
     fi
 }
-
-# ============================================================
-# 申请证书
-# ============================================================
-
-issue_certificate() {
-
-    mkdir -p "${HYSTERIA_DIR}"
-
-    chmod 700 "${HYSTERIA_DIR}"
-
-    # 已经存在证书
-    if [[
-        -s "${CERT_FILE}" &&
-        -s "${KEY_FILE}" &&
-        -s "${DOMAIN_FILE}"
-    ]]; then
-
-        local old_domain
-
-        old_domain="$(cat "${DOMAIN_FILE}")"
-
-        if [[ "${old_domain}" == "${DOMAIN}" ]]; then
-
-            info "检测到已有 ${DOMAIN} 证书。"
-
-            "${ACME_HOME}/acme.sh" \
-                --renew \
-                -d "${DOMAIN}" \
-                --ecc ||
-                true
-
-        fi
-    else
-
-        check_port_80
-
-        info "申请 Let's Encrypt ECC 证书..."
-
-        "${ACME_HOME}/acme.sh" \
-            --issue \
-            -d "${DOMAIN}" \
-            --standalone \
-            --keylength ec-256
-    fi
-
-    info "部署证书..."
-
-    "${ACME_HOME}/acme.sh" \
-        --install-cert \
-        -d "${DOMAIN}" \
-        --ecc \
-        --key-file "${KEY_FILE}" \
-        --fullchain-file "${CERT_FILE}" \
-        --reloadcmd \
-        "systemctl try-reload-or-restart hysteria-server.service >/dev/null 2>&1 || true"
-
-    [[ -s "${CERT_FILE}" ]] || {
-        die "证书文件生成失败：${CERT_FILE}"
-    }
-
-    [[ -s "${KEY_FILE}" ]] || {
-        die "私钥文件生成失败：${KEY_FILE}"
-    }
-
-    chmod 644 "${CERT_FILE}"
-    chmod 600 "${KEY_FILE}"
-
-    printf '%s\n' "${DOMAIN}" > "${DOMAIN_FILE}"
-
-    chmod 600 "${DOMAIN_FILE}"
-
-    log "TLS 证书部署成功。"
-}
-
-# ============================================================
-# 输入端口
-# ============================================================
-
-input_port() {
-
-    read -rp \
-        "Hysteria 2 监听端口 [30010]: " \
-        PORT
-
-    PORT="${PORT:-30010}"
-
-    valid_port "${PORT}" || {
-        die "端口必须是 1-65535。"
-    }
-
-    if udp_port_in_use "${PORT}"; then
-
-        die "UDP ${PORT} 已经被其他程序占用。"
-    fi
-}
-
-# ============================================================
-# 输入端口跳跃
-# ============================================================
-
-input_port_hopping() {
-
-    read -rp \
-        "启用 UDP 端口跳跃？[y/N]: " \
-        ENABLE_HOP
-
-    ENABLE_HOP="${ENABLE_HOP:-N}"
-
-    HOP_RANGE=""
-
-    if [[ "${ENABLE_HOP}" =~ ^[Yy]$ ]]; then
-
-        read -rp \
-            "端口跳跃范围 [30010-30100]: " \
-            HOP_RANGE
-
-        HOP_RANGE="${HOP_RANGE:-30010-30100}"
-
-        [[ "${HOP_RANGE}" =~ ^[0-9]+-[0-9]+$ ]] || {
-            die "端口范围格式错误，例如：30010-30100"
-        }
-
-        local first
-        local last
-
-        first="${HOP_RANGE%-*}"
-        last="${HOP_RANGE#*-}"
-
-        valid_port "${first}" || {
-            die "跳跃起始端口无效。"
-        }
-
-        valid_port "${last}" || {
-            die "跳跃结束端口无效。"
-        }
-
-        (( first < last )) || {
-            die "结束端口必须大于起始端口。"
-        }
-
-        # 监听范围中的第一个端口不能被占用
-        if udp_port_in_use "${first}"; then
-            die "UDP ${first} 已被占用。"
-        fi
-
-        log "启用端口跳跃：${HOP_RANGE}"
-    fi
-}
-
-# ============================================================
-# 输入密码
-# ============================================================
-
-input_passwords() {
-
-    read -rp \
-        "Hysteria 2 密码（回车随机生成）: " \
-        AUTH_PASSWORD
-
-    if [[ -z "${AUTH_PASSWORD}" ]]; then
-
-        AUTH_PASSWORD="$(random_password)"
-
-        log "已自动生成 Hysteria 2 密码。"
-    fi
-
-    read -rp \
-        "Salamander 混淆密码（回车随机生成）: " \
-        OBFS_PASSWORD
-
-    if [[ -z "${OBFS_PASSWORD}" ]]; then
-
-        OBFS_PASSWORD="$(random_password)"
-
-        log "已自动生成 Salamander 密码。"
-    fi
-}
-
-# ============================================================
-# 伪装网站
-# ============================================================
-
-input_masquerade() {
-
-    read -rp \
-        "伪装网站 [https://www.cloudflare.com/]: " \
-        MASQUERADE_URL
-
-    MASQUERADE_URL="${MASQUERADE_URL:-https://www.cloudflare.com/}"
-
-    if [[ ! "${MASQUERADE_URL}" =~ ^https?:// ]]; then
-
-        MASQUERADE_URL="https://${MASQUERADE_URL}"
-    fi
-}
-
-# ============================================================
-# 生成配置
-# ============================================================
 
 write_config() {
+    local tmp
+    tmp="$(mktemp "${ETC}/config.yaml.XXXXXX")"
 
-    local listen_address
+    {
+        if [[ -n "$HY2_HOPPING" ]]; then
+            printf 'listen: ":%s"\n' "${HY2_HOPPING%-*}"
+        else
+            printf 'listen: "%s"\n' "$HY2_LISTEN"
+        fi
 
-    if [[ -n "${HOP_RANGE}" ]]; then
-
-        listen_address=":${HOP_RANGE}"
-
-    else
-
-        listen_address=":${PORT}"
-    fi
-
-    mkdir -p "${HYSTERIA_DIR}"
-
-    chmod 700 "${HYSTERIA_DIR}"
-
-    cat > "${CONFIG_FILE}" <<EOF
-listen: ${listen_address}
-
-tls:
-  cert: ${CERT_FILE}
-  key: ${KEY_FILE}
+        cat <<EOF
+acme:
+  domains:
+    - ${HY2_DOMAIN}
+  email: ${HY2_EMAIL}
+  type: http
 
 auth:
   type: password
-  password: ${AUTH_PASSWORD}
+  password: '${HY2_PASSWORD}'
 
 obfs:
   type: salamander
   salamander:
-    password: ${OBFS_PASSWORD}
+    password: '${HY2_OBFS_PASSWORD}'
 
 masquerade:
   type: proxy
   proxy:
-    url: ${MASQUERADE_URL}
+    url: https://news.ycombinator.com/
     rewriteHost: true
 EOF
+    } > "$tmp"
 
-    chmod 600 "${CONFIG_FILE}"
-
-    cat > "${ENV_FILE}" <<EOF
-DOMAIN='${DOMAIN}'
-PORT='${PORT}'
-HOP_RANGE='${HOP_RANGE}'
-AUTH_PASSWORD='${AUTH_PASSWORD}'
-OBFS_PASSWORD='${OBFS_PASSWORD}'
-MASQUERADE_URL='${MASQUERADE_URL}'
-EOF
-
-    chmod 600 "${ENV_FILE}"
-
-    printf '%s\n' "${DOMAIN}" > "${DOMAIN_FILE}"
-
-    chmod 600 "${DOMAIN_FILE}"
-
-    log "Hysteria 配置文件已生成："
-    echo "  ${CONFIG_FILE}"
+    # 先 root 写入，再让服务用户只读。
+    chown root:"$GROUP" "$tmp"
+    chmod 0640 "$tmp"
+    mv -f "$tmp" "$CONF"
 }
 
-# ============================================================
-# systemd
-# ============================================================
+write_meta() {
+    local tmp
+    tmp="$(mktemp "${ETC}/installer.env.XXXXXX")"
+    cat > "$tmp" <<EOF
+HY2_DOMAIN=$(printf '%q' "$HY2_DOMAIN")
+HY2_EMAIL=$(printf '%q' "$HY2_EMAIL")
+HY2_PASSWORD=$(printf '%q' "$HY2_PASSWORD")
+HY2_OBFS_PASSWORD=$(printf '%q' "$HY2_OBFS_PASSWORD")
+HY2_LISTEN=$(printf '%q' "$HY2_LISTEN")
+HY2_HOPPING=$(printf '%q' "$HY2_HOPPING")
+HY2_VERSION=$(printf '%q' "$INSTALLED_VERSION")
+EOF
+    chown root:"$GROUP" "$tmp"
+    chmod 0640 "$tmp"
+    mv -f "$tmp" "$META"
+}
 
-write_systemd() {
-
-    cat > "${SERVICE_FILE}" <<EOF
+write_systemd_unit() {
+    cat > "${SYSTEMD_UNIT}.new" <<EOF
 [Unit]
 Description=Hysteria 2 Server
-Documentation=https://www.hy2.io/
+Documentation=https://v2.hysteria.network/
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-
-ExecStart=${HYSTERIA_BIN} server -c ${CONFIG_FILE}
-
-WorkingDirectory=${HYSTERIA_DIR}
-
+User=${USER}
+Group=${GROUP}
+WorkingDirectory=${ETC}
+ExecStart=${BIN} server -c ${CONF}
 Restart=on-failure
-RestartSec=5
+RestartSec=3
+UMask=0077
 
-LimitNOFILE=1048576
-LimitNPROC=512
+# Only the capabilities needed for low ports and Hysteria port hopping.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+NoNewPrivileges=true
 
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-
-NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=${ETC}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    chmod 644 "${SERVICE_FILE}"
+    chmod 0644 "${SYSTEMD_UNIT}.new"
+    mv -f "${SYSTEMD_UNIT}.new" "$SYSTEMD_UNIT"
 
     systemctl daemon-reload
-
-    systemctl enable hysteria-server.service >/dev/null
-
-    log "systemd 服务已配置。"
+    systemctl enable --now hysteria-server.service
 }
 
-# ============================================================
-# 配置检查
-# ============================================================
+write_openrc_unit() {
+    cat > "${OPENRC_UNIT}.new" <<EOF
+#!/sbin/openrc-run
 
-check_config() {
+name="hysteria"
+description="Hysteria 2 Server"
+command="${BIN}"
+command_args="server -c ${CONF}"
+command_user="${USER}:${GROUP}"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/hysteria.log"
+error_log="/var/log/hysteria.err"
 
-    info "检查 Hysteria 配置..."
+depend() {
+    need net
+}
+EOF
+    chmod 0755 "${OPENRC_UNIT}.new"
+    mv -f "${OPENRC_UNIT}.new" "$OPENRC_UNIT"
 
-    if "${HYSTERIA_BIN}" server --help >/dev/null 2>&1; then
-        :
-    fi
-
-    # 使用实际启动测试捕获配置错误
-    timeout 3 \
-        "${HYSTERIA_BIN}" server \
-        -c "${CONFIG_FILE}" \
-        >/tmp/hysteria-config-test.log \
-        2>&1 &
-    
-    local pid=$!
-
-    sleep 1
-
-    if ! kill -0 "${pid}" 2>/dev/null; then
-
-        if grep -Eqi \
-            'error|fatal|invalid|failed' \
-            /tmp/hysteria-config-test.log; then
-
-            cat /tmp/hysteria-config-test.log
-
-            die "Hysteria 配置检查失败。"
-        fi
-
-    fi
-
-    kill "${pid}" 2>/dev/null ||
-        true
-
-    wait "${pid}" 2>/dev/null ||
-        true
-
-    rm -f /tmp/hysteria-config-test.log
-
-    log "配置检查完成。"
+    rc-update add hysteria default >/dev/null
+    rc-service hysteria restart 2>/dev/null || rc-service hysteria start
 }
 
-# ============================================================
-# 启动
-# ============================================================
-
-start_service() {
-
-    systemctl daemon-reload
-
-    systemctl enable hysteria-server.service >/dev/null
-
-    systemctl restart hysteria-server.service
-
-    sleep 2
-
-    if ! systemctl is-active --quiet hysteria-server.service; then
-
-        echo
-
-        systemctl --no-pager -l \
-            status hysteria-server.service ||
-            true
-
-        echo
-
-        journalctl \
-            -u hysteria-server.service \
-            -n 50 \
-            --no-pager ||
-            true
-
-        die "Hysteria 2 启动失败。"
-    fi
-
-    log "Hysteria 2 服务运行正常。"
-}
-
-# ============================================================
-# 分享链接
-# ============================================================
-
-generate_share_link() {
-
-    local host
-    local server_port
-
-    host="${DOMAIN}"
-
-    if [[ -n "${HOP_RANGE}" ]]; then
-
-        server_port="${HOP_RANGE}"
-
+write_service() {
+    if [[ "$INIT" == "systemd" ]]; then
+        write_systemd_unit
     else
-
-        server_port="${PORT}"
+        write_openrc_unit
     fi
-
-    local encoded_auth
-    local encoded_obfs
-
-    encoded_auth="$(urlencode "${AUTH_PASSWORD}")"
-    encoded_obfs="$(urlencode "${OBFS_PASSWORD}")"
-
-    SHARE_LINK="hysteria2://${encoded_auth}@${host}:${server_port}?sni=${host}&obfs=salamander&obfs-password=${encoded_obfs}#HY2"
-
-    printf '%s\n' "${SHARE_LINK}" > "${SHARE_FILE}"
-
-    chmod 600 "${SHARE_FILE}"
 }
 
-# ============================================================
-# 显示信息
-# ============================================================
+service_restart() {
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl restart hysteria-server
+    else
+        rc-service hysteria restart
+    fi
+}
+
+service_stop() {
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl disable --now hysteria-server.service 2>/dev/null || true
+    else
+        rc-service hysteria stop 2>/dev/null || true
+        rc-update del hysteria default 2>/dev/null || true
+    fi
+}
+
+service_status() {
+    if [[ "$INIT" == "systemd" ]]; then
+        systemctl --no-pager --full status hysteria-server.service
+    else
+        rc-service hysteria status
+    fi
+}
+
+detect_public_ip() {
+    IPV4="$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+    IPV6="$(curl -6 -fsS --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
+}
+
+build_uri() {
+    local host="$HY2_DOMAIN"
+    local port="$HY2_LISTEN"
+    local params="sni=${HY2_DOMAIN}&obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}"
+
+    if [[ -n "$HY2_HOPPING" ]]; then
+        port="$HY2_HOPPING"
+        params="${params}&mport=${HY2_HOPPING}"
+    fi
+
+    # URI fragment 中只放节点名称；密码/混淆密码进行 URL 编码。
+    local epass eobfs
+    epass="$(python3 - "$HY2_PASSWORD" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=''))
+PY
+)"
+    eobfs="$(python3 - "$HY2_OBFS_PASSWORD" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=''))
+PY
+)"
+
+    params="sni=${HY2_DOMAIN}&obfs=salamander&obfs-password=${eobfs}"
+    printf 'hysteria2://%s@%s%s?%s#Hysteria2\n' "$epass" "$host" "$port" "$params"
+}
 
 show_info() {
-
-    echo
-
-    echo -e "${CYAN}"
-    echo "============================================================"
-    echo "                  Hysteria 2 安装完成"
-    echo "============================================================"
-    echo -e "${RESET}"
-
-    echo "域名        : ${DOMAIN}"
-
-    if [[ -n "${HOP_RANGE}" ]]; then
-
-        echo "监听端口    : ${PORT}"
-        echo "UDP 端口跳跃: ${HOP_RANGE}"
-
+    if [[ -r "$META" ]]; then
+        # shellcheck disable=SC1090
+        . "$META"
     else
-
-        echo "监听端口    : ${PORT}"
-        echo "UDP 端口跳跃: 未启用"
-
+        die "没有找到安装信息：$META"
     fi
 
-    echo "配置文件    : ${CONFIG_FILE}"
-    echo "证书        : ${CERT_FILE}"
-    echo "私钥        : ${KEY_FILE}"
-    echo "服务        : hysteria-server.service"
-
     echo
-
-    echo -e "${GREEN}Hysteria 2 分享链接：${RESET}"
-
-    cat "${SHARE_FILE}"
-
+    echo "========== Hysteria 2 =========="
+    "$BIN" version 2>/dev/null || true
     echo
-
-    if command -v qrencode >/dev/null 2>&1; then
-
-        echo -e "${GREEN}二维码：${RESET}"
-
-        qrencode -t ANSIUTF8 \
-            < "${SHARE_FILE}" ||
-            true
-
-        echo
-    fi
+    echo "域名       : ${HY2_DOMAIN}"
+    echo "监听       : ${HY2_LISTEN}"
+    echo "Port Hop   : ${HY2_HOPPING:-禁用}"
+    echo "服务用户   : ${USER}"
+    echo
+    echo "Hysteria2 URI:"
+    build_uri
+    echo
+    echo "配置文件   : ${CONF}"
+    echo "日志       : journalctl -u hysteria-server -f"
+    echo "================================"
 }
 
-# ============================================================
-# 安装
-# ============================================================
-
-install_cmd() {
-
+install_or_update() {
     require_root
+    detect_os
+    install_deps
+    ensure_user
 
-    install_dependencies
+    INSTALLED_VERSION="$(get_latest_version)"
+    log "目标版本：${INSTALLED_VERSION}"
 
-    echo
-
-    read -rp \
-        "请输入证书域名，例如 hy.example.com: " \
-        DOMAIN
-
-    [[ -n "${DOMAIN}" ]] || {
-        die "域名不能为空。"
-    }
-
-    [[ "${DOMAIN}" =~ ^[A-Za-z0-9.-]+$ ]] || {
-        die "域名格式无效。"
-    }
-
-    check_domain "${DOMAIN}"
-
-    install_acme
-
-    issue_certificate
-
-    input_port
-
-    input_port_hopping
-
-    input_passwords
-
-    input_masquerade
-
-    write_config
-
-    write_systemd
-
-    check_config
-
-    start_service
-
-    generate_share_link
-
-    show_info
-
-    echo
-
-    log "安装完成。"
-
-    echo
-
-    echo "常用管理命令："
-
-    echo "  $0 status"
-    echo "  $0 restart"
-    echo "  $0 logs"
-    echo "  $0 info"
-    echo "  $0 uninstall"
-
-    echo
-
-    echo "或者直接使用 systemctl："
-
-    echo "  systemctl status hysteria-server"
-    echo "  systemctl restart hysteria-server"
-    echo "  journalctl -u hysteria-server -f"
-}
-
-# ============================================================
-# status
-# ============================================================
-
-status_cmd() {
-
-    systemctl \
-        --no-pager \
-        -l \
-        status \
-        hysteria-server.service
-}
-
-# ============================================================
-# restart
-# ============================================================
-
-restart_cmd() {
-
-    systemctl restart hysteria-server.service
-
-    sleep 1
-
-    if systemctl is-active --quiet hysteria-server.service; then
-
-        log "Hysteria 2 重启成功。"
-
+    if [[ "$1" == "install" ]]; then
+        prompt_install_values
+        download_verified_binary "$INSTALLED_VERSION"
+        write_config
+        write_meta
+        write_service
     else
-
-        systemctl \
-            --no-pager \
-            -l \
-            status \
-            hysteria-server.service ||
-            true
-
-        die "Hysteria 2 重启失败。"
+        # 更新时保留现有配置。
+        [[ -f "$CONF" && -f "$META" ]] || die "尚未安装，请先执行：$0 install"
+        # shellcheck disable=SC1090
+        . "$META"
+        download_verified_binary "$INSTALLED_VERSION"
+        write_meta
+        service_restart
     fi
-}
 
-# ============================================================
-# logs
-# ============================================================
-
-logs_cmd() {
-
-    journalctl \
-        -u hysteria-server.service \
-        -n 100 \
-        --no-pager
-}
-
-# ============================================================
-# info
-# ============================================================
-
-info_cmd() {
-
-    [[ -f "${ENV_FILE}" ]] || {
-        die "未检测到 Hysteria 2 安装。"
-    }
-
-    # shellcheck disable=SC1090
-    source "${ENV_FILE}"
-
-    generate_share_link
-
+    log "安装/更新完成。"
     show_info
 }
 
-# ============================================================
-# 卸载
-# ============================================================
-
-uninstall_cmd() {
-
+uninstall() {
     require_root
+    detect_os
 
     echo
-
-    warn "此操作将卸载 Hysteria 2。"
-
-    warn "同时删除："
-
-    echo "  - Hysteria 2"
-    echo "  - systemd 服务"
-    echo "  - Hysteria 配置"
-    echo "  - 分享链接"
-    echo "  - 本脚本管理的证书文件"
-
+    warn "这将停止 Hysteria 2 并删除："
+    echo "  ${BIN}"
+    echo "  ${ETC}"
+    [[ "$INIT" == "systemd" ]] && echo "  ${SYSTEMD_UNIT}"
+    [[ "$INIT" == "openrc" ]] && echo "  ${OPENRC_UNIT}"
     echo
 
-    read -rp \
-        "输入 YES 确认卸载: " \
-        CONFIRM
+    read -r -p "确认卸载？请输入 YES： " confirm
+    [[ "$confirm" == "YES" ]] || { log "已取消。"; exit 0; }
 
-    if [[ "${CONFIRM}" != "YES" ]]; then
+    service_stop
 
-        log "已取消卸载。"
-
-        exit 0
+    if [[ "$INIT" == "systemd" ]]; then
+        rm -f "$SYSTEMD_UNIT"
+        systemctl daemon-reload
+    else
+        rm -f "$OPENRC_UNIT"
     fi
 
-    systemctl disable \
-        --now \
-        hysteria-server.service \
-        2>/dev/null ||
-        true
+    # 仅删除本安装器自己创建的文件，不碰其他 iptables/nftables 规则。
+    rm -f "$BIN"
+    rm -rf "$ETC"
 
-    rm -f "${SERVICE_FILE}"
-
-    systemctl daemon-reload
-
-    # 尝试删除 acme.sh 中对应域名
-    if [[
-        -x "${ACME_HOME}/acme.sh" &&
-        -f "${DOMAIN_FILE}"
-    ]]; then
-
-        local domain
-
-        domain="$(cat "${DOMAIN_FILE}")"
-
-        "${ACME_HOME}/acme.sh" \
-            --remove \
-            -d "${domain}" \
-            --ecc \
-            2>/dev/null ||
-            true
+    if getent passwd "$USER" >/dev/null 2>&1; then
+        if command -v userdel >/dev/null 2>&1; then
+            userdel "$USER" 2>/dev/null || true
+        else
+            deluser "$USER" 2>/dev/null || true
+        fi
     fi
-
-    rm -f "${HYSTERIA_BIN}"
-
-    rm -rf "${HYSTERIA_DIR}"
+    if getent group "$GROUP" >/dev/null 2>&1; then
+        if command -v groupdel >/dev/null 2>&1; then
+            groupdel "$GROUP" 2>/dev/null || true
+        else
+            delgroup "$GROUP" 2>/dev/null || true
+        fi
+    fi
 
     log "Hysteria 2 已卸载。"
-
-    warn "acme.sh 本身未删除，因为它可能被其他证书使用。"
 }
-
-# ============================================================
-# help
-# ============================================================
-
-usage() {
-
-    cat <<EOF
-
-Hysteria 2 管理脚本
-
-用法：
-
-  $0
-      安装 / 配置 Hysteria 2
-
-  $0 install
-      安装 / 配置 Hysteria 2
-
-  $0 status
-      查看服务状态
-
-  $0 restart
-      重启 Hysteria 2
-
-  $0 logs
-      查看最近 100 条日志
-
-  $0 info
-      查看节点信息 / 分享链接
-
-  $0 uninstall
-      卸载 Hysteria 2
-
-EOF
-}
-
-# ============================================================
-# 主程序
-# ============================================================
 
 main() {
+    local action="${1:-install}"
 
-    case "${1:-install}" in
-
-        install)
-            install_cmd
+    case "$action" in
+        install|update)
+            install_or_update "$action"
             ;;
-
-        status)
-            status_cmd
-            ;;
-
-        restart)
-            restart_cmd
-            ;;
-
-        logs)
-            logs_cmd
-            ;;
-
         info)
-            info_cmd
+            require_root
+            detect_os
+            show_info
             ;;
-
+        status)
+            require_root
+            detect_os
+            service_status
+            ;;
+        restart)
+            require_root
+            detect_os
+            service_restart
+            ;;
+        stop)
+            require_root
+            detect_os
+            service_stop
+            ;;
         uninstall|remove)
-            uninstall_cmd
+            uninstall
             ;;
-
-        -h|--help|help)
-            usage
+        version)
+            echo "$VERSION"
             ;;
-
         *)
-            usage
+            cat <<EOF
+Hysteria 2 Installer v${VERSION}
+
+用法：
+  $0 install       安装
+  $0 update        更新官方 Hysteria
+  $0 info          显示节点信息
+  $0 status        查看服务状态
+  $0 restart       重启服务
+  $0 stop          停止服务
+  $0 uninstall     完整卸载
+  $0 version       显示安装器版本
+EOF
             exit 1
             ;;
-
     esac
 }
 
